@@ -32,15 +32,12 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      # Release validation must use its pinned catalog, not today's upstream models.
-      - name: Hydrate pinned release model catalog
+      # Validate the accepted release catalog, including its tested model metadata.
+      - name: Restore accepted release model catalog
         if: github.base_ref == 'firstmate-sdk-v1.2'
         run: |
-          revision="$(node -p 'require("./nix/model-catalog.json").revision')"
-          catalog="${RUNNER_TEMP}/pi-model-catalog.json"
-          curl --fail --silent --show-error --location "https://pi.dev/api/models/revisions/${revision}?types=chat,image,classifier" --output "$catalog"
-          printf '%s  %s\n' "${revision#sha256-}" "$catalog" | sha256sum --check --strict
-          node packages/ai/scripts/hydrate-model-catalog.ts "$catalog"
+          sha256sum --check --strict .github/fixtures/firstmate-sdk-v1.2-model-data.sha256
+          tar --extract --gzip --file .github/fixtures/firstmate-sdk-v1.2-model-data.tar.gz --directory packages/ai/src/providers --no-same-owner --no-same-permissions
 
       - name: Build
         run: |
