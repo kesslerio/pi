@@ -74,7 +74,7 @@ export class FileModelsStore implements ModelsStore {
 	): Promise<StoredModels> {
 		return this.storage.withLockAsync(async (content) => {
 			const data = this.parse(content);
-			this.updateReadState(readState, data, getFileRevision(this.path));
+			this.updateReadState(readState, data, getFileRevision(this.path, content));
 			return { result: data };
 		}, options);
 	}

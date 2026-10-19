@@ -10,6 +10,7 @@ import {
 	type TUI,
 	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
+import { hasToolRendererDefinition } from "../../../core/extensions/tool-renderers.ts";
 import type { ToolDefinition, ToolRenderContext, ToolRenderers } from "../../../core/extensions/types.ts";
 
 /** What this component needs from a tool: how to draw it, without executing it. */
@@ -36,6 +37,8 @@ export class ToolExecutionComponent extends Container {
 	private selfRenderHeight = 0;
 	private callRendererComponent?: Component;
 	private resultRendererComponent?: Component;
+	private callRendererRegion?: MouseRegion;
+	private resultRendererRegion?: MouseRegion;
 	private rendererState: any = {};
 	private imageComponents: Image[] = [];
 	/** Inputs of imageComponents, so updateDisplay can reuse images and keep their converted PNG data. */
@@ -61,6 +64,7 @@ export class ToolExecutionComponent extends Container {
 		durationMs?: number;
 	};
 	private hideComponent = false;
+	private renderedEmpty = false;
 
 	constructor(
 		toolName: string,
@@ -110,7 +114,9 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private hasRendererDefinition(): boolean {
-		return this.toolDefinition !== undefined;
+		// A visibility-only adapter over an absent definition keeps the generic stock formatter.
+		// Legacy objects and registered definitions still select the renderer-based fallback.
+		return hasToolRendererDefinition(this.toolDefinition);
 	}
 
 	private getRenderShell(): "default" | "self" {
@@ -165,6 +171,15 @@ export class ToolExecutionComponent extends Container {
 			this.setExpanded(!this.expanded);
 			return { handled: true };
 		});
+	}
+
+	private getRendererRegion(component: Component, slot: "call" | "result"): MouseRegion {
+		const current = slot === "call" ? this.callRendererRegion : this.resultRendererRegion;
+		if (current?.children[0] === component) return current;
+		const region = this.createResultRegion(component);
+		if (slot === "call") this.callRendererRegion = region;
+		else this.resultRendererRegion = region;
+		return region;
 	}
 
 	updateArgs(args: any): void {
@@ -225,7 +240,8 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override render(width: number): string[] {
-		if (this.hideComponent) {
+		if (!this.isRowVisible()) {
+			this.renderedEmpty = true;
 			return [];
 		}
 
@@ -233,6 +249,7 @@ export class ToolExecutionComponent extends Container {
 			const contentLines = this.selfRenderContainer.render(width);
 			this.selfRenderHeight = contentLines.length;
 			if (contentLines.length === 0 && this.imageComponents.length === 0) {
+				this.renderedEmpty = true;
 				return [];
 			}
 
@@ -251,13 +268,17 @@ export class ToolExecutionComponent extends Container {
 					lines.push(...imageComponent.render(width));
 				}
 			}
+			this.renderedEmpty = lines.length === 0;
 			return lines;
 		}
 
-		return super.render(width);
+		const lines = super.render(width);
+		this.renderedEmpty = lines.length === 0;
+		return lines;
 	}
 
 	override handleMouse(event: TuiMouseEvent): ReturnType<Container["handleMouse"]> {
+		if (!this.isVisible()) return undefined;
 		if (!this.hasRendererDefinition() || this.getRenderShell() !== "self") return super.handleMouse(event);
 		if (event.y <= 0 || event.y > this.selfRenderHeight) return undefined;
 		return this.selfRenderContainer.handleMouse({
@@ -265,6 +286,20 @@ export class ToolExecutionComponent extends Container {
 			y: event.y - 1,
 			height: this.selfRenderHeight,
 		});
+	}
+
+	isVisible(): boolean {
+		return this.isRowVisible() && !this.renderedEmpty;
+	}
+
+	private isRowVisible(): boolean {
+		if (this.hideComponent) return false;
+		try {
+			return this.toolDefinition?.isVisible?.(this.getRenderContext(undefined)) ?? true;
+		} catch {
+			// Like failed call/result renderers, a failed predicate keeps the tool output available.
+			return true;
+		}
 	}
 
 	private updateDisplay(): void {
@@ -286,17 +321,17 @@ export class ToolExecutionComponent extends Container {
 
 			const callRenderer = this.getCallRenderer();
 			if (!callRenderer) {
-				renderContainer.addChild(this.createResultRegion(this.createCallFallback()));
+				renderContainer.addChild(this.getRendererRegion(this.createCallFallback(), "call"));
 				hasContent = true;
 			} else {
 				try {
 					const component = callRenderer(this.args, theme, this.getRenderContext(this.callRendererComponent));
 					this.callRendererComponent = component;
-					renderContainer.addChild(this.createResultRegion(component));
+					renderContainer.addChild(this.getRendererRegion(component, "call"));
 					hasContent = true;
 				} catch {
 					this.callRendererComponent = undefined;
-					renderContainer.addChild(this.createResultRegion(this.createCallFallback()));
+					renderContainer.addChild(this.getRendererRegion(this.createCallFallback(), "call"));
 					hasContent = true;
 				}
 			}
@@ -306,7 +341,7 @@ export class ToolExecutionComponent extends Container {
 				if (!resultRenderer) {
 					const component = this.createResultFallback();
 					if (component) {
-						renderContainer.addChild(this.createResultRegion(component));
+						renderContainer.addChild(this.getRendererRegion(component, "result"));
 						hasContent = true;
 					}
 				} else {
@@ -318,19 +353,27 @@ export class ToolExecutionComponent extends Container {
 							this.getRenderContext(this.resultRendererComponent),
 						);
 						this.resultRendererComponent = component;
-						renderContainer.addChild(this.createResultRegion(component));
+						renderContainer.addChild(this.getRendererRegion(component, "result"));
 						hasContent = true;
 					} catch {
 						this.resultRendererComponent = undefined;
 						const component = this.createResultFallback();
 						if (component) {
-							renderContainer.addChild(this.createResultRegion(component));
+							renderContainer.addChild(this.getRendererRegion(component, "result"));
 							hasContent = true;
 						}
 					}
 				}
 			}
+			if (this.callRendererRegion && !renderContainer.children.includes(this.callRendererRegion)) {
+				this.callRendererRegion = undefined;
+			}
+			if (this.resultRendererRegion && !renderContainer.children.includes(this.resultRendererRegion)) {
+				this.resultRendererRegion = undefined;
+			}
 		} else {
+			this.callRendererRegion = undefined;
+			this.resultRendererRegion = undefined;
 			this.contentText.setCustomBgFn(bgFn);
 			this.contentText.setPaddingX(this.outputPad);
 			this.contentText.setText(this.formatToolExecution());

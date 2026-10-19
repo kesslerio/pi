@@ -43,7 +43,13 @@ export interface OAuthCallbackServer<T> {
 }
 
 function sendPage(response: ServerResponse, status: number, html: string): void {
-	response.writeHead(status, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+	// This short-lived listener may close as soon as the page is sent. Do not let
+	// clients pool its socket for a later sign-in on the same callback port.
+	response.writeHead(status, {
+		"content-type": "text/html; charset=utf-8",
+		"cache-control": "no-store",
+		connection: "close",
+	});
 	response.end(html);
 }
 

@@ -1,3 +1,4 @@
+import { DOCUMENT_CHILD_WIDTH, renderInputChild, renderWithInputContext } from "../input-context.ts";
 import {
 	type Component,
 	dispatchMouseEvent,
@@ -18,8 +19,16 @@ export class MouseRegion implements Component {
 		this.onMouse = onMouse;
 	}
 
+	get children(): readonly Component[] {
+		return [this.child];
+	}
+
 	render(width: number): string[] {
-		return this.child.render(width);
+		return renderWithInputContext(this, width, () => renderInputChild(this.child, width)).lines;
+	}
+
+	[DOCUMENT_CHILD_WIDTH](width: number): number | undefined {
+		return this.render === MouseRegion.prototype.render ? width : undefined;
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseDispatchResult | TuiMouseEventResult | undefined {

@@ -1,3 +1,9 @@
+import {
+	DOCUMENT_CHILD_WIDTH,
+	recordInputViewport,
+	renderInputChild,
+	renderWithInputContext,
+} from "../input-context.ts";
 import { allocateStackSizes, Stack, type StackChild, type StackOptions, visibleStackEntries } from "./stack.ts";
 
 export class VStack extends Stack {
@@ -7,10 +13,19 @@ export class VStack extends Stack {
 		super(children, options);
 	}
 
+	override [DOCUMENT_CHILD_WIDTH](width: number): number | undefined {
+		return this.render === VStack.prototype.render ? Math.max(1, width) : undefined;
+	}
+
 	override render(width: number): string[] {
+		return renderWithInputContext(this, width, () => this.renderContent(width)).lines;
+	}
+
+	private renderContent(width: number): string[] {
 		const viewport = { width: Math.max(1, width), height: Number.MAX_SAFE_INTEGER };
+		recordInputViewport(viewport);
 		const entries = visibleStackEntries(this.entries, viewport);
-		const rendered = entries.map((entry) => entry.component.render(viewport.width));
+		const rendered = entries.map((entry) => renderInputChild(entry.component, viewport.width, entry));
 		const sizes = allocateStackSizes(
 			entries,
 			rendered.map((lines) => lines.length),

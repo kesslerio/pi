@@ -319,14 +319,17 @@ describe("RemoteExecutionEnv against NodeExecutionEnv", () => {
 			await local.writeFile(path, content, context);
 			await remote.writeFile(path, content, context);
 		}
-		const api = (env: ExecutionEnv, output: string[]) =>
-			({
-				env,
-				outputWindow: undefined,
-				output: (chunk: string | Uint8Array) => output.push(String(chunk)),
-				diagnostic: () => {},
-				details: async () => {},
-			}) as unknown as ToolExecutionApi;
+		const api = (
+			env: ExecutionEnv,
+			output: string[],
+		): Pick<ToolExecutionApi, "env" | "outputWindow" | "output" | "retainedOutput" | "diagnostic" | "details"> => ({
+			env,
+			outputWindow: undefined,
+			output: (chunk: string | Uint8Array) => output.push(String(chunk)),
+			retainedOutput: () => ({ text: output.join(""), truncated: false }),
+			diagnostic: () => {},
+			details: async () => {},
+		});
 		const run = async (
 			env: ExecutionEnv,
 			tool: ReturnType<typeof createReadTool> | ReturnType<typeof createBashTool>,
@@ -334,13 +337,13 @@ describe("RemoteExecutionEnv against NodeExecutionEnv", () => {
 		) => {
 			const output: string[] = [];
 			try {
-				const result = await tool.execute(args as never, api(env, output), context);
+				const result = await tool.execute(args as never, api(env, output) as ToolExecutionApi, context);
 				return { result, output: output.join("") };
 			} catch (error) {
 				return { error: (error as Error).message, output: output.join("") };
 			}
 		};
-		const cases: [ReturnType<typeof createReadTool> | ReturnType<typeof createBashTool>, object][] = [
+		const cases: [ReturnType<typeof createReadTool> | ReturnType<typeof createBashTool>, object, string?][] = [
 			[createReadTool(), { path: "text.txt" }],
 			[createReadTool(), { path: "text.txt", offset: 2, limit: 1 }],
 			[createReadTool(), { path: "big.txt" }],
@@ -348,14 +351,58 @@ describe("RemoteExecutionEnv against NodeExecutionEnv", () => {
 			[createReadTool(), { path: "bom.txt" }],
 			[createReadTool(), { path: "bad.txt" }],
 			[createReadTool(), { path: "missing.txt" }],
-			[createBashTool(), { command: "cat text.txt; echo err >&2; exit 0" }],
-			[createBashTool(), { command: "exit 3" }],
+			// One pipe gives this exact-output comparison a defined order. Separate pipes are checked below.
+			[createBashTool(), { command: "{ cat text.txt; echo err >&2; exit 0; } 2>&1" }, "one\ntwo\n\nthreeerr\n"],
+			[createBashTool(), { command: "exit 3" }, ""],
 			[createBashTool(), { command: "printf 'a\\nb'; ls" }],
 		];
-		for (const [tool, args] of cases) {
-			const expected = normalize(await run(local, tool, args), roots[0]);
-			const actual = normalize(await run(remote, tool, args), roots[1]);
-			expect(actual, JSON.stringify(args)).toEqual(expected);
+		for (const [tool, args, expectedOutput] of cases) {
+			const expected = await run(local, tool, args);
+			const actual = await run(remote, tool, args);
+			for (const value of [expected, actual]) {
+				if ("path" in args && args.path === "missing.txt") {
+					expect(value).toHaveProperty("error", expect.stringContaining("missing.txt"));
+				} else {
+					expect(value).not.toHaveProperty("error");
+				}
+				if (expectedOutput !== undefined) expect(value.output).toBe(expectedOutput);
+				if (tool.name === "bash") {
+					const exitCode = "command" in args && args.command === "exit 3" ? 3 : 0;
+					expect(value).toMatchObject({
+						result: { structuredOutput: { output: value.output, truncated: false, exitCode } },
+					});
+					if (exitCode === 0) {
+						expect(value).not.toHaveProperty("result.isError", true);
+					} else {
+						expect(value).toMatchObject({
+							result: {
+								isError: true,
+								diagnostics: [{ severity: "error", code: "exit_code", message: "Command exited with code 3" }],
+							},
+						});
+					}
+				}
+			}
+			expect(normalize(actual, roots[1]), JSON.stringify(args)).toEqual(normalize(expected, roots[0]));
 		}
 	}, 60_000);
+
+	it("preserves each pipe's output without imposing cross-stream arrival order", async () => {
+		const { local, remote } = pair();
+		for (const env of [local, remote]) {
+			const output = { stdout: "", stderr: "" };
+			const result = await env.exec(
+				"printf 'out-one\\n'; printf 'err-one\\n' >&2; printf 'out-two\\n'; printf 'err-two\\n' >&2",
+				{
+					onOutput: (text, _context, info) => {
+						expect(info.skipped).toBeUndefined();
+						output[info.stream] += text;
+					},
+				},
+				context,
+			);
+			expect(result).toEqual({ ok: true, value: { exitCode: 0 } });
+			expect(output).toEqual({ stdout: "out-one\nout-two\n", stderr: "err-one\nerr-two\n" });
+		}
+	});
 });

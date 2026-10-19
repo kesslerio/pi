@@ -1,4 +1,5 @@
-import { realpathSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve as nodeResolvePath, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,10 +34,14 @@ export function canonicalizePath(path: string): string {
 	}
 }
 
-export function getFileRevision(path: string): string | undefined {
+export function getFileRevision(path: string, content?: string): string | undefined {
 	try {
 		const stats = statSync(path, { bigint: true });
-		return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+		// Timestamp precision can make different same-size contents share a stat tuple.
+		const digest = createHash("sha256")
+			.update(content ?? readFileSync(path))
+			.digest("hex");
+		return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}:${digest}`;
 	} catch {
 		return undefined;
 	}

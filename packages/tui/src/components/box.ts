@@ -1,4 +1,10 @@
-import { type Component, dispatchMouseEvent, type TuiMouseDispatchResult, type TuiMouseEvent } from "../tui.ts";
+import { DOCUMENT_CHILD_WIDTH, renderInputChild, renderWithInputContext } from "../input-context.ts";
+import {
+	type Component,
+	dispatchMouseEventFromOwner,
+	type TuiMouseDispatchResult,
+	type TuiMouseEvent,
+} from "../tui.ts";
 import { flattenLines, visibleWidth } from "../utils.ts";
 
 type RenderCache = {
@@ -59,6 +65,14 @@ export class Box implements Component {
 		this.cache = undefined;
 	}
 
+	[DOCUMENT_CHILD_WIDTH](width: number): number | undefined {
+		return this.render === Box.prototype.render ? this.getContentWidth(width) : undefined;
+	}
+
+	private getContentWidth(width: number): number {
+		return Math.max(1, width - this.paddingX * 2);
+	}
+
 	private matchCache(width: number, childLines: string[], bgSample: string | undefined): boolean {
 		const cache = this.cache;
 		return (
@@ -78,7 +92,7 @@ export class Box implements Component {
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseDispatchResult | undefined {
-		const contentWidth = Math.max(1, event.width - this.paddingX * 2);
+		const contentWidth = this.getContentWidth(event.width);
 		const contentY = event.y - this.paddingY;
 		const contentX = event.x - this.paddingX;
 		if (contentY < 0 || contentX < 0 || contentX >= contentWidth) return undefined;
@@ -90,7 +104,8 @@ export class Box implements Component {
 		let childY = 0;
 		for (const { component: child, height: childHeight } of mouseChildren) {
 			if (contentY >= childY && contentY < childY + childHeight) {
-				return dispatchMouseEvent(child, {
+				if (!this.children.includes(child)) return undefined;
+				return dispatchMouseEventFromOwner(this, child, {
 					...event,
 					x: contentX,
 					y: contentY - childY,
@@ -104,11 +119,15 @@ export class Box implements Component {
 	}
 
 	render(width: number): string[] {
+		return renderWithInputContext(this, width, () => this.renderContent(width)).lines;
+	}
+
+	private renderContent(width: number): string[] {
 		if (this.children.length === 0) {
 			return [];
 		}
 
-		const contentWidth = Math.max(1, width - this.paddingX * 2);
+		const contentWidth = this.getContentWidth(width);
 		const leftPad = " ".repeat(this.paddingX);
 
 		// Render all children. Keep the child lines unpadded: children usually return the same string
@@ -117,7 +136,7 @@ export class Box implements Component {
 		const childLines: string[] = [];
 		const mouseChildren: Array<{ component: Component; height: number }> = [];
 		for (const child of this.children) {
-			const lines = child.render(contentWidth);
+			const lines = renderInputChild(child, contentWidth);
 			mouseChildren.push({ component: child, height: lines.length });
 			for (const line of lines) {
 				childLines.push(line);

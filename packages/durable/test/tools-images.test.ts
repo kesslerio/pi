@@ -8,7 +8,7 @@ import type { ToolDiagnostic, ToolExecutionApi, ToolExecutionResult } from "@ear
 import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
 import { createCodingTools } from "@earendil-works/pi-durable/tools";
 import { initSync, PhotonImage } from "@silvia-odwyer/photon/photon_rs.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getOrThrow } from "../src/env/index.ts";
 import { NodeExecutionEnv } from "../src/env/node.ts";
 import { exifOrientation } from "../src/images/exif.ts";
@@ -486,9 +486,35 @@ describe("imageDimensions", () => {
 
 describe("toBase64", () => {
 	it("matches Buffer for every remainder length", () => {
-		for (const length of [0, 1, 2, 3, 4, 5, 10_000]) {
+		for (const length of [0, 1, 2, 3, 4, 5, 6_143, 6_144, 6_145, 10_000, 12_287, 12_288, 12_289]) {
 			const bytes = Uint8Array.from({ length }, (_, index) => (index * 37) % 256);
 			expect(toBase64(bytes)).toBe(Buffer.from(bytes).toString("base64"));
+		}
+	});
+
+	it("round-trips multi-megabyte offset views without changing their bytes", () => {
+		for (const remainder of [0, 1, 2]) {
+			const length = 3 * 1024 * 1024 + remainder;
+			const backing = new Uint8Array(length + 20).fill(0xa5);
+			const bytes = backing.subarray(7, 7 + length);
+			for (let index = 0; index < bytes.length; index++) bytes[index] = (index * 37) % 256;
+			const original = backing.slice();
+			const encoded = toBase64(bytes);
+			expect(encoded).toBe(Buffer.from(bytes).toString("base64"));
+			expect(Buffer.from(encoded, "base64").equals(bytes)).toBe(true);
+			expect(Buffer.from(backing).equals(original)).toBe(true);
+		}
+	});
+
+	it("does not require Buffer or btoa", () => {
+		const bytes = Uint8Array.from({ length: 256 }, (_, index) => index);
+		const expected = Buffer.from(bytes).toString("base64");
+		vi.stubGlobal("Buffer", undefined);
+		vi.stubGlobal("btoa", undefined);
+		try {
+			expect(toBase64(bytes)).toBe(expected);
+		} finally {
+			vi.unstubAllGlobals();
 		}
 	});
 });

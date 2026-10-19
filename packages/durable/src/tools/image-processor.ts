@@ -41,25 +41,27 @@ export const INLINE_IMAGE_TYPES: ReadonlySet<string> = new Set(["image/png", "im
 
 const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/** Standard base64 of `bytes`, without platform APIs such as `Buffer` or `btoa`. */
+/** Standard base64 of `bytes`, using portable typed arrays and `TextDecoder` rather than `Buffer` or `btoa`. */
 export function toBase64(bytes: Uint8Array): string {
 	const parts: string[] = [];
-	let chunk = "";
+	const chunk = new Uint8Array(8192);
+	const decoder = new TextDecoder();
+	let written = 0;
 	for (let i = 0; i < bytes.length; i += 3) {
 		const a = bytes[i]!;
 		const b = bytes[i + 1];
 		const c = bytes[i + 2];
-		chunk += BASE64[a >> 2]!;
-		chunk += BASE64[((a & 3) << 4) | ((b ?? 0) >> 4)]!;
-		chunk += b === undefined ? "=" : BASE64[((b & 15) << 2) | ((c ?? 0) >> 6)]!;
-		chunk += c === undefined ? "=" : BASE64[c & 63]!;
-		// Join in pieces: one string grown a character at a time is slow for megabytes.
-		if (chunk.length >= 8192) {
-			parts.push(chunk);
-			chunk = "";
+		chunk[written++] = BASE64.charCodeAt(a >> 2);
+		chunk[written++] = BASE64.charCodeAt(((a & 3) << 4) | ((b ?? 0) >> 4));
+		chunk[written++] = b === undefined ? 61 : BASE64.charCodeAt(((b & 15) << 2) | ((c ?? 0) >> 6));
+		chunk[written++] = c === undefined ? 61 : BASE64.charCodeAt(c & 63);
+		// Flat ASCII chunks avoid allocating one string node per character and leaving a large GC pause afterward.
+		if (written === chunk.length) {
+			parts.push(decoder.decode(chunk));
+			written = 0;
 		}
 	}
-	parts.push(chunk);
+	if (written > 0) parts.push(decoder.decode(chunk.subarray(0, written)));
 	return parts.join("");
 }
 

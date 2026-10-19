@@ -44,6 +44,12 @@ export class CustomEntryComponent extends Container {
 		this.rebuild();
 	}
 
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		// An empty child must not leave the host-owned leading spacer behind.
+		return lines.length === 1 && lines[0] === "" ? [] : lines;
+	}
+
 	private rebuild(): void {
 		this.clear();
 		this.customComponent = undefined;

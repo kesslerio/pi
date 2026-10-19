@@ -59,9 +59,26 @@ test_env=(
 	"NPM_CONFIG_USERCONFIG=$test_root/npm-userconfig"
 	"NPM_CONFIG_GLOBALCONFIG=$test_root/npm-globalconfig"
 	"NPM_CONFIG_CACHE=$test_root/cache/npm"
+	"NPM_CONFIG_UPDATE_NOTIFIER=false"
 	"PI_NO_LOCAL_LLM=1"
 	"AWS_EC2_METADATA_DISABLED=true"
 )
+
+# Preserve only explicit boolean npm safety settings, never caller config files.
+for name in NPM_CONFIG_OFFLINE NPM_CONFIG_IGNORE_SCRIPTS; do
+	if [[ -n "${!name+x}" ]]; then
+		case "${!name}" in
+			true|false) test_env+=("$name=${!name}") ;;
+			*) printf 'Expected true or false for %s\n' "$name" >&2; exit 1 ;;
+		esac
+	fi
+done
+
+# Test fixture installs must remain local to the isolated test environment.
+case "${NPM_CONFIG_GLOBAL-false}" in
+	false) test_env+=("NPM_CONFIG_GLOBAL=false") ;;
+	*) printf 'Tests require NPM_CONFIG_GLOBAL=false\n' >&2; exit 1 ;;
+esac
 
 # Native Windows needs these inherited values to launch child processes.
 for name in SystemRoot SYSTEMROOT WINDIR COMSPEC PATHEXT; do
