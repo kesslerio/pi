@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, firstmate-sdk-v1.2]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -27,13 +27,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
-          sudo ln -s $(which fdfind) /usr/local/bin/fd
+          sudo ln -s "$(which fdfind)" /usr/local/bin/fd
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
+      # Validate the accepted release catalog, including its tested model metadata.
+      - name: Restore accepted release model catalog
+        if: github.base_ref == 'firstmate-sdk-v1.2'
+        run: |
+          sha256sum --check --strict .github/fixtures/firstmate-sdk-v1.2-model-data.sha256
+          tar --extract --gzip --file .github/fixtures/firstmate-sdk-v1.2-model-data.tar.gz --directory packages/ai/src/providers --no-same-owner --no-same-permissions
+
       - name: Build
-        run: npm run build
+        run: |
+          if [[ "$GITHUB_BASE_REF" == "firstmate-sdk-v1.2" ]]; then
+            npm run build:offline
+          else
+            npm run build
+          fi
 
       - name: Check
         run: npm run check

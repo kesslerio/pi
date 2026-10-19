@@ -1,6 +1,7 @@
 import type { ScrollView } from "./components/scroll-view.ts";
 import { allocateStackSizes, visibleStackEntries } from "./components/stack.ts";
-import { getLayoutNode } from "./layout-node.ts";
+import { type InputRenderContext, type InputRenderResult, renderWithInputContext } from "./input-context.ts";
+import { getLayoutNode, type StackLayoutEntry } from "./layout-node.ts";
 import { cropKittyImageLine, getKittyImageMetadata, isImageLine } from "./terminal-image.ts";
 import { type Component, CURSOR_MARKER, compositeTuiLine } from "./tui.ts";
 import {
@@ -22,6 +23,8 @@ export interface LayoutRect {
 
 export interface LayoutBox {
 	component: Component;
+	/** Context for this occurrence; intrinsic measurements are never mounted input paths. */
+	inputContext: InputRenderContext;
 	rect: LayoutRect;
 	clip: LayoutRect;
 	children: LayoutBox[];
@@ -52,7 +55,7 @@ export interface ScrollbarGeometry {
 
 interface LayoutContext {
 	viewport: { width: number; height: number };
-	renderCache: Map<Component, Map<number, string[]>>;
+	renderCache: Map<Component, Map<number, InputRenderResult>>;
 	requestRender: () => void;
 	primaryScrollView: ScrollView | undefined;
 }
@@ -65,31 +68,32 @@ function intersect(a: LayoutRect, b: LayoutRect): LayoutRect {
 	return { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) };
 }
 
-function renderCached(context: LayoutContext, component: Component, width: number): string[] {
+function renderCached(context: LayoutContext, component: Component, width: number): InputRenderResult {
 	const safeWidth = Math.max(1, Math.floor(width));
 	let widths = context.renderCache.get(component);
 	if (!widths) {
-		widths = new Map<number, string[]>();
+		widths = new Map<number, InputRenderResult>();
 		context.renderCache.set(component, widths);
 	}
 	let lines = widths.get(safeWidth);
 	if (!lines) {
-		lines = component.render(safeWidth);
+		lines = renderWithInputContext(component, safeWidth);
 		widths.set(safeWidth, lines);
 	}
 	return lines;
 }
 
 function measureHeight(context: LayoutContext, component: Component, width: number): number {
-	return renderCached(context, component, width).length;
+	return renderCached(context, component, width).lines.length;
 }
 
 function measureWidth(context: LayoutContext, component: Component, width: number): number {
-	return renderCached(context, component, width).reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+	return renderCached(context, component, width).lines.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
 }
 
-function withParent(box: LayoutBox, parent: LayoutBox): LayoutBox {
+function withParent(box: LayoutBox, parent: LayoutBox, entry?: StackLayoutEntry): LayoutBox {
 	box.parent = parent;
+	if (entry) box.inputContext = { ...box.inputContext, entry };
 	return box;
 }
 
@@ -115,7 +119,8 @@ function layoutComponent(
 	const safeWidth = Math.max(1, Math.floor(width));
 	const node = getLayoutNode(component);
 	if (!node) {
-		const lines = renderCached(context, component, safeWidth);
+		const rendered = renderCached(context, component, safeWidth);
+		const lines = rendered.lines;
 		const allocatedHeight = height === undefined ? lines.length : Math.max(0, Math.floor(height));
 		let lineOffset = 0;
 		if (lines.length > allocatedHeight && allocatedHeight > 0) {
@@ -124,6 +129,7 @@ function layoutComponent(
 		}
 		return {
 			component,
+			inputContext: rendered.context,
 			rect: { x, y, width: safeWidth, height: allocatedHeight },
 			clip: intersect(clip, { x, y, width: safeWidth, height: allocatedHeight }),
 			children: [],
@@ -155,11 +161,12 @@ function layoutComponent(
 		const childClip = intersect(clip, rect);
 		const box: LayoutBox = {
 			component,
+			inputContext: { component, width: safeWidth, viewport: context.viewport, children: [childBox.inputContext] },
 			rect,
 			clip: childClip,
 			children: [childBox],
 			scrollView,
-			scrollContentLines: renderCached(context, node.component, contentWidth),
+			scrollContentLines: renderCached(context, node.component, contentWidth).lines,
 			layer: 0,
 		};
 		childBox.parent = box;
@@ -179,6 +186,7 @@ function layoutComponent(
 		const rect = { x, y, width: safeWidth, height: allocatedHeight };
 		const box: LayoutBox = {
 			component,
+			inputContext: { component, width: safeWidth, viewport: context.viewport, children: [] },
 			rect,
 			clip: intersect(clip, rect),
 			children: [],
@@ -190,10 +198,12 @@ function layoutComponent(
 				withParent(
 					layoutComponent(context, entries[index]!.component, x, childY, safeWidth, sizes[index]!, box.clip),
 					box,
+					entries[index],
 				),
 			);
 			childY += sizes[index]! + node.gap;
 		}
+		box.inputContext.children = box.children.map((child) => child.inputContext);
 		return box;
 	}
 
@@ -211,6 +221,7 @@ function layoutComponent(
 	const rect = { x, y, width: safeWidth, height: allocatedHeight };
 	const box: LayoutBox = {
 		component,
+		inputContext: { component, width: safeWidth, viewport: context.viewport, children: [] },
 		rect,
 		clip: intersect(clip, rect),
 		children: [],
@@ -227,6 +238,13 @@ function layoutComponent(
 		if (childWidth === 0) {
 			box.children.push({
 				component: entries[index]!.component,
+				inputContext: {
+					component: entries[index]!.component,
+					entry: entries[index],
+					width: 0,
+					viewport: context.viewport,
+					children: [],
+				},
 				rect: { x: childX, y: childY, width: 0, height: childHeight },
 				clip: { x: childX, y: childY, width: 0, height: 0 },
 				children: [],
@@ -238,11 +256,13 @@ function layoutComponent(
 				withParent(
 					layoutComponent(context, entries[index]!.component, childX, childY, childWidth, childHeight, box.clip),
 					box,
+					entries[index],
 				),
 			);
 		}
 		childX += childWidth + node.gap;
 	}
+	box.inputContext.children = box.children.map((child) => child.inputContext);
 	return box;
 }
 

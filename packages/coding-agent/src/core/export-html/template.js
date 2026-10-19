@@ -1075,6 +1075,7 @@
                 if (output) html += formatExpandableOutput(output, 10);
               }
             }
+            html += renderResultImages();
           }
         }
 

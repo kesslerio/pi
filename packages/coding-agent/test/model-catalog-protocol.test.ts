@@ -108,45 +108,63 @@ describe("model catalog protocol with the current client", () => {
 	});
 
 	it("negotiates the catalog for its version and reaches the OpenRouter API", async () => {
-		allowNetwork();
-		const runtime = await ModelRuntime.create({
-			credentials: new InMemoryCredentialStore(),
-			modelsPath: null,
-			catalogBaseUrl,
-			refreshOnCreate: false,
-		});
-		await runtime.setRuntimeApiKey("openrouter", "test-key");
-		const refresh = await runtime.refresh({ allowNetwork: true, force: true, providers: ["openrouter"] });
-		expect([...refresh.errors]).toEqual([]);
-
-		const catalogUrl = "/api/models/providers/openrouter?types=chat%2Cimage%2Cclassifier";
-		expect(requests).toEqual([catalogUrl, `${catalogUrl}&pi-version=${VERSION}`]);
-
-		const expectedModel =
-			selectModelCatalog(index, VERSION)?.revision === legacyRevision ? legacyModel : mixedApiModel;
-		const model = runtime.getModel("openrouter", modelId);
-		expect(model).toMatchObject({ api: expectedModel.api, baseUrl: expectedModel.baseUrl });
-		if (!model) throw new Error(`Missing model: openrouter/${modelId}`);
-
-		let providerUrl: URL | undefined;
+		let providerRequest: Request | undefined;
+		let metadataRequest: Request | undefined;
 		const nativeFetch = globalThis.fetch;
-		vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-			const request = new Request(input, init);
-			if (new URL(request.url).origin !== "https://openrouter.ai") return nativeFetch(request);
-			providerUrl = new URL(request.url);
-			throw new Error("Provider request captured");
-		});
 		try {
-			await runtime.completeSimple(
+			allowNetwork();
+			vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+				const request = new Request(input, init);
+				const url = new URL(request.url);
+				if (url.origin === catalogBaseUrl) return nativeFetch(request);
+				if (request.url === "https://openrouter.ai/api/v1/models/user") {
+					metadataRequest = request;
+					// The dummy key is rejected without changing the negotiated catalog.
+					return new Response(null, { status: 401 });
+				}
+				if (
+					url.origin === "https://openrouter.ai" &&
+					(url.pathname === "/api/v1/messages" || url.pathname === "/api/v1/chat/completions")
+				) {
+					// The Anthropic beta client adds query parameters to the endpoint.
+					providerRequest = request;
+					throw new Error("Provider request captured");
+				}
+				throw new Error(`Unexpected fetch request: ${request.url}`);
+			});
+			const runtime = await ModelRuntime.create({
+				credentials: new InMemoryCredentialStore(),
+				modelsPath: null,
+				catalogBaseUrl,
+				refreshOnCreate: false,
+			});
+			await runtime.setRuntimeApiKey("openrouter", "test-key");
+			const refresh = await runtime.refresh({ allowNetwork: true, force: true, providers: ["openrouter"] });
+			expect([...refresh.errors]).toEqual([]);
+			expect(metadataRequest?.method).toBe("GET");
+			expect(metadataRequest?.headers.get("authorization")).toBe("Bearer test-key");
+
+			const catalogUrl = "/api/models/providers/openrouter?types=chat%2Cimage%2Cclassifier";
+			expect(requests).toEqual([catalogUrl, `${catalogUrl}&pi-version=${VERSION}`]);
+
+			const expectedModel =
+				selectModelCatalog(index, VERSION)?.revision === legacyRevision ? legacyModel : mixedApiModel;
+			const model = runtime.getModel("openrouter", modelId);
+			expect(model).toMatchObject({ api: expectedModel.api, baseUrl: expectedModel.baseUrl });
+			if (!model) throw new Error(`Missing model: openrouter/${modelId}`);
+
+			const completion = await runtime.completeSimple(
 				model,
 				{ messages: [{ role: "user", content: "Hello", timestamp: 0 }] },
 				{ apiKey: "test-key", maxRetries: 0 },
 			);
+			expect(providerRequest?.method, completion.errorMessage).toBe("POST");
+			const providerUrl = providerRequest && new URL(providerRequest.url);
+			expect(providerUrl?.pathname).toBe(
+				expectedModel.api === "anthropic-messages" ? "/api/v1/messages" : "/api/v1/chat/completions",
+			);
 		} finally {
 			vi.unstubAllGlobals();
 		}
-		expect(providerUrl?.pathname).toBe(
-			expectedModel.api === "anthropic-messages" ? "/api/v1/messages" : "/api/v1/chat/completions",
-		);
 	});
 });

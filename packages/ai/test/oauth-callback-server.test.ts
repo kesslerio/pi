@@ -136,6 +136,57 @@ describe.sequential("OAuth callback server", () => {
 		await expect(server.wait()).resolves.toBe("done");
 	});
 
+	for (const outcome of ["success", "exchange-error", "provider-error"] as const) {
+		it(`does not advertise a reusable callback connection after ${outcome}`, async () => {
+			let completions = 0;
+			const server = await start<string>({
+				complete: async (code) => {
+					completions++;
+					if (outcome === "exchange-error") throw new Error("exchange denied");
+					return `completed:${code}`;
+				},
+			});
+			const stray = await nativeFetch(callbackUrl(server.redirectUri, { code: "ignored", state: "wrong" }));
+			expect(stray.status).toBe(400);
+			expect(await stray.text()).toContain("State mismatch.");
+			expect(completions).toBe(0);
+			// Match sign-in callers: settle and close the listener before the browser
+			// consumes the response, while keeping both promise outcomes observed.
+			const settled = server
+				.wait()
+				.then(
+					(value) => ({ value }),
+					(error: Error) => ({ error }),
+				)
+				.finally(() => server.close());
+			const params: Record<string, string> =
+				outcome === "provider-error"
+					? { error: "access_denied", state: "expected-state" }
+					: { code: "valid", state: "expected-state" };
+			const browser = nativeFetch(callbackUrl(server.redirectUri, params)).then(async (response) => ({
+				status: response.status,
+				connection: response.headers.get("connection"),
+				body: await response.text(),
+			}));
+			const [result, response] = await Promise.all([settled, browser]);
+			expect(response.connection).toBe("close");
+			expect(response.status).toBe(outcome === "success" ? 200 : outcome === "exchange-error" ? 502 : 400);
+			expect(response.body).toContain(
+				outcome === "success"
+					? "Signed in to Example."
+					: outcome === "exchange-error"
+						? "exchange denied"
+						: "access_denied",
+			);
+			expect(completions).toBe(outcome === "provider-error" ? 0 : 1);
+			if (outcome === "success") expect(result).toEqual({ value: "completed:valid" });
+			else
+				expect("error" in result && result.error.message).toContain(
+					outcome === "exchange-error" ? "exchange denied" : "access_denied",
+				);
+		});
+	}
+
 	it("resolves with undefined after cancel", async () => {
 		const server = await start<string>();
 		server.cancel();

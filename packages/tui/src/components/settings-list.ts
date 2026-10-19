@@ -72,6 +72,10 @@ export class SettingsList implements Component {
 		}
 	}
 
+	get children(): readonly Component[] {
+		return this.submenuComponent ? [this.submenuComponent] : this.searchInput ? [this.searchInput] : [];
+	}
+
 	/** Update an item's currentValue */
 	updateValue(id: string, newValue: string): void {
 		const item = this.items.find((i) => i.id === id);

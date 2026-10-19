@@ -6,6 +6,7 @@ import {
 } from "./alt-screen-search.ts";
 import { AltScreenFlashContainer } from "./components/alt-screen-flash.ts";
 import { ScrollView } from "./components/scroll-view.ts";
+import type { InputMount } from "./input-context.ts";
 import { getKeybindings } from "./keybindings.ts";
 import { isKeyRelease } from "./keys.ts";
 import {
@@ -17,7 +18,7 @@ import {
 	renderLayoutFrame,
 	type ScrollbarGeometry,
 } from "./layout.ts";
-import { getLayoutNode } from "./layout-node.ts";
+import { getLayoutNode, type StackLayoutEntry } from "./layout-node.ts";
 import type { Terminal } from "./terminal.ts";
 import {
 	deleteAllKittyImages,
@@ -36,9 +37,7 @@ import {
 	Container,
 	CURSOR_MARKER,
 	compositeTuiLine,
-	dispatchMouseEvent,
 	type OverlayHandle,
-	retargetMouseEvent,
 	TuiBase,
 	type TuiMouseButton,
 	type TuiMouseDispatchResult,
@@ -234,6 +233,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private mousePressTarget?: TuiMouseDispatchTarget;
 	private mousePressPoint?: { x: number; y: number };
 	private mousePressMoved = false;
+	private mouseGestureCancelled = false;
 	private lastComponentClick?: {
 		timestamp: number;
 		count: number;
@@ -259,13 +259,12 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		options: TuiAltScreenOptions = {},
 	) {
 		super(terminal, showHardwareCursor, logDirectory);
-		this.implicitDocument = {
-			render: (width) => super.render(width),
-			handleMouse: (event) => super.handleMouse(event),
-			invalidate: () => {
-				for (const child of this.children) child.invalidate();
-			},
-		};
+		// The implicit document is the actual stock owner for rendering and mouse
+		// dispatch. Calling super.handleMouse with this=TuiAltScreen would record
+		// a different owner from the component mounted under implicitScrollView.
+		const implicitDocument = new Container();
+		Object.defineProperty(implicitDocument, "children", { get: () => this.children });
+		this.implicitDocument = implicitDocument;
 		this.implicitScrollView = new ScrollView(this.implicitDocument, { follow: "end", primary: true });
 		this.flashes = new AltScreenFlashContainer(() => this.requestRender());
 		this.wheelScroll = new WheelScrollAccelerator(options.wheelScrollLines ?? 1);
@@ -328,6 +327,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		if (this.layoutRoot === component) return;
 		this.layoutRoot = component;
 		this.currentLayout = undefined;
+		this.validateMouseTargets();
 		this.requestRender();
 	}
 
@@ -337,6 +337,18 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	protected override getMountedRoots(): readonly Component[] {
 		return this.layoutRoot ? [this.layoutRoot] : this.children;
+	}
+
+	protected override getRootInputMount(): InputMount {
+		const width = Math.max(1, this.terminal.columns);
+		const height = Math.max(1, this.terminal.rows);
+		const component = this.layoutRoot ?? this.implicitScrollView;
+		return {
+			component,
+			width,
+			viewport: { width, height },
+			rendered: this.currentLayout?.root.component === component ? this.currentLayout.root.inputContext : undefined,
+		};
 	}
 
 	private getPrimaryScrollView(): ScrollView {
@@ -368,6 +380,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.selectionDragged = false;
 		this.clearComponentMouseGesture();
 		this.lastComponentClick = undefined;
+		this.mouseGestureCancelled = false;
 		this.resetRenderState();
 		const term = process.env.TERM?.toLowerCase() ?? "";
 		// Multiplexers can lag when every pointer movement is forwarded. Button-motion
@@ -677,6 +690,22 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.mousePressMoved = false;
 	}
 
+	protected override validateInputTargets(): void {
+		super.validateInputTargets();
+		this.validateMouseTargets();
+	}
+
+	protected override validateMouseTargets(): void {
+		if (
+			(this.mouseCapture && !this.isMouseTargetEligible(this.mouseCapture)) ||
+			(this.mousePressTarget && !this.isMouseTargetEligible(this.mousePressTarget))
+		) {
+			this.clearComponentMouseGesture();
+			this.lastComponentClick = undefined;
+			this.mouseGestureCancelled = true;
+		}
+	}
+
 	private handleViewportInput(data: string): { consume?: boolean } | undefined {
 		if (data === FOCUS_OUT) {
 			const hadActiveSelection = this.selectionPressActive;
@@ -838,22 +867,36 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			if (visited.has(box.component)) continue;
 			if (getLayoutNode(box.component) && box.component.handleMouse === Container.prototype.handleMouse) continue;
 			visited.add(box.component);
-			const result = dispatchMouseEvent(box.component, {
-				...event,
-				x: event.screenX - box.rect.x,
-				y: event.screenY - box.rect.y,
-				width: box.rect.width,
-				height: box.rect.height,
-			});
+			const ancestors: Component[] = [];
+			const layoutEntries: StackLayoutEntry[] = [];
+			let current = box;
+			if (current.inputContext.entry) layoutEntries.push(current.inputContext.entry);
+			while (current.parent) {
+				current = current.parent;
+				ancestors.push(current.component);
+				if (current.inputContext.entry) layoutEntries.push(current.inputContext.entry);
+			}
+			const result = this.dispatchMouseFromRoot(
+				box.component,
+				{
+					...event,
+					x: event.screenX - box.rect.x,
+					y: event.screenY - box.rect.y,
+					width: box.rect.width,
+					height: box.rect.height,
+				},
+				ancestors,
+				layoutEntries.reverse(),
+			);
 			if (result) return result;
 		}
 		return undefined;
 	}
 
 	private applyMouseDispatchResult(event: TuiMouseEvent, result: TuiMouseDispatchResult): boolean {
-		const focusTarget = this.resolveMouseFocusTarget(result.focusTarget ?? result.target.component);
+		const focusTarget = this.resolveMouseFocusTarget(result.focusTarget ?? result.target.component, result.target);
 		const focusChanged = result.focus === true && this.getFocusedComponent() !== focusTarget;
-		if (result.focus) this.setFocus(focusTarget);
+		if (result.focus) this.setMouseFocus(focusTarget, result.target);
 		if (result.capture) this.mouseCapture = result.target;
 		return (
 			result.render ??
@@ -863,13 +906,6 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 				event.type === "drag" ||
 				event.type === "wheel")
 		);
-	}
-
-	private dispatchMouseToTarget(
-		event: TuiMouseEvent,
-		target: TuiMouseDispatchTarget,
-	): TuiMouseDispatchResult | undefined {
-		return dispatchMouseEvent(target.component, retargetMouseEvent(event, target));
 	}
 
 	private getComponentClickCount(target: TuiMouseDispatchTarget, x: number, y: number): number {
@@ -899,6 +935,12 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	}
 
 	private handleMouseEvent(raw: SgrMouseEvent): void {
+		if (this.mouseGestureCancelled) {
+			if (raw.release) this.mouseGestureCancelled = false;
+			else if ((raw.button & 32) === 0) this.mouseGestureCancelled = false;
+			else if (this.decodeMouseButton(raw.button) !== "none") return;
+			if (raw.release) return;
+		}
 		const isMotion = (raw.button & 32) !== 0;
 		const type: TuiMouseEvent["type"] = raw.release
 			? "release"

@@ -192,6 +192,20 @@ Pi records the initial prompt and tool set in the transcript's first system mess
 
 A tool's `renderCall` and `renderResult` draw its calls in the interactive transcript and in HTML exports. `pi.registerToolRenderer((toolName, next) => renderers)` chooses renderers for calls to any tool, including tools that are not registered yet, such as MCP tools in a resumed session before their server connected. `next()` returns what the remaining resolvers (in extension load order), then the registered tool, would use, so `next() ?? mine` only fills in.
 
+Set `isVisible(context)` on a tool definition or its resolved renderers to control the entire TUI row. Returning `false` removes all lines, including the leading spacer, background, and inline images, and disables input to the row and its descendants. The same row keeps receiving argument, result, image, padding, and expansion updates. Showing it again displays the latest state; hidden mouse gestures and keyboard focus are cancelled and require fresh interaction. Omitting the predicate keeps the stock display. HTML exports always retain the content and do not call this predicate.
+
+```typescript
+let showToolRows = true;
+pi.registerToolRenderer((_toolName, next) => ({
+  ...next(),
+  isVisible: (context) => showToolRows || context.isError,
+}));
+```
+
+The predicate receives the current `ToolRenderContext`, including the shared renderer state; `lastComponent` is `undefined` because visibility belongs to the whole row. Keep it synchronous and free of side effects. When changing external visibility state, call a renderer context's `invalidate()` to request a repaint, including for rows created hidden. Call and result renderers continue updating while hidden. If the predicate throws, Pi shows the row, matching the fallback behavior of failed tool renderers; handle expected errors inside the predicate if another policy is needed.
+
+Adding only visibility preserves the fallback selected by `next()`, including the generic stock display when an unregistered or resumed tool has no definition. Existing registered definitions and empty legacy renderer objects keep their standard renderer shell and result expansion behavior. An explicit `renderShell` or custom call/result slot selects renderer composition.
+
 ### MCP servers
 
 `pi.registerMcpServer(name, config)` adds an MCP server for the current session. `config` has the shape of an `mcpServers` entry in [`mcp.json`](mcp.md): `command`, `args`, `env`, and `cwd` for stdio servers, `url`, `headers`, and `oauth` for HTTP servers, plus `exposure`, `toolExposure`, `description`, `enabled`, and `timeout`.

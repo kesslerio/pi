@@ -1,4 +1,5 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CredentialStore, createModels, type Provider } from "@earendil-works/pi-ai";
@@ -18,6 +19,7 @@ describe("AuthStorage", () => {
 	afterEach(() => {
 		if (existsSync(tempDir)) rmSync(tempDir, { recursive: true });
 		vi.restoreAllMocks();
+		syncBuiltinESMExports();
 	});
 
 	function writeAuthJson(data: Record<string, unknown>): void {
@@ -137,6 +139,76 @@ describe("AuthStorage", () => {
 		await expect(second).resolves.toEqual({ type: "api_key", key: "new" });
 		expect(lockSpy).toHaveBeenCalledTimes(1);
 		expect(release).toHaveBeenCalledTimes(1);
+	});
+
+	test("reloads same-size replacements even when filesystem metadata is unchanged", async () => {
+		writeAuthJson({ anthropic: { type: "api_key", key: "old" } });
+		const storage = AuthStorage.create(authJsonPath);
+		const originalStatSync = fs.statSync;
+		const frozenStats = originalStatSync(authJsonPath, { bigint: true });
+		vi.spyOn(fs, "statSync").mockImplementation((path, options) => {
+			if (path === authJsonPath && options?.bigint === true) return frozenStats;
+			return originalStatSync(path, options);
+		});
+		syncBuiltinESMExports();
+		const lockSpy = vi.spyOn(lockfile, "lock");
+
+		writeAuthJson({ anthropic: { type: "api_key", key: "new" } });
+		expect(fs.statSync(authJsonPath, { bigint: true })).toBe(frozenStats);
+		expect(originalStatSync(authJsonPath, { bigint: true }).size).toBe(frozenStats.size);
+		await expect(storage.read("anthropic", { signal: new AbortController().signal })).resolves.toEqual({
+			type: "api_key",
+			key: "new",
+		});
+		expect(lockSpy).toHaveBeenCalledTimes(1);
+		await expect(storage.read("anthropic")).resolves.toEqual({ type: "api_key", key: "new" });
+		expect(lockSpy).toHaveBeenCalledTimes(1);
+
+		writeAuthJson({ anthropic: { type: "api_key", key: "end" } });
+		expect(originalStatSync(authJsonPath, { bigint: true }).size).toBe(frozenStats.size);
+		const recreated = AuthStorage.create(authJsonPath);
+		await expect(recreated.read("anthropic", { signal: new AbortController().signal })).resolves.toEqual({
+			type: "api_key",
+			key: "end",
+		});
+		await expect(storage.read("anthropic")).resolves.toEqual({ type: "api_key", key: "end" });
+		expect(lockSpy).toHaveBeenCalledTimes(1);
+	});
+
+	test("rejects a signalled stale read when storage access is denied and recovers on retry", async () => {
+		writeAuthJson({ anthropic: { type: "api_key", key: "old" } });
+		const storage = AuthStorage.create(authJsonPath);
+		writeAuthJson({ anthropic: { type: "api_key", key: "replacement" } });
+		const denied = Object.assign(new Error("auth storage access denied"), { code: "EACCES" });
+		const lockSpy = vi.spyOn(lockfile, "lock").mockRejectedValueOnce(denied);
+
+		await expect(storage.read("anthropic", { signal: new AbortController().signal })).rejects.toMatchObject({
+			code: "EACCES",
+		});
+		expect(JSON.parse(readFileSync(authJsonPath, "utf8"))).toEqual({
+			anthropic: { type: "api_key", key: "replacement" },
+		});
+		lockSpy.mockRestore();
+		await expect(storage.read("anthropic", { signal: new AbortController().signal })).resolves.toEqual({
+			type: "api_key",
+			key: "replacement",
+		});
+	});
+
+	test("rejects a signalled malformed replacement and recovers after the file is repaired", async () => {
+		writeAuthJson({ anthropic: { type: "api_key", key: "old" } });
+		const storage = AuthStorage.create(authJsonPath);
+		writeFileSync(authJsonPath, "{invalid-json", "utf8");
+
+		await expect(storage.read("anthropic", { signal: new AbortController().signal })).rejects.toBeInstanceOf(
+			SyntaxError,
+		);
+		expect(readFileSync(authJsonPath, "utf8")).toBe("{invalid-json");
+		writeAuthJson({ anthropic: { type: "api_key", key: "repaired" } });
+		await expect(storage.read("anthropic", { signal: new AbortController().signal })).resolves.toEqual({
+			type: "api_key",
+			key: "repaired",
+		});
 	});
 
 	test.skipIf(process.platform === "win32")("creates new auth files with owner-only permissions", () => {

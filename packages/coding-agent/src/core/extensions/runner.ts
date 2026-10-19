@@ -25,6 +25,7 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
 import type { VirtualModelDefinition } from "../virtual-models.ts";
+import { hasToolRendererDefinition } from "./tool-renderers.ts";
 import type {
 	AgentBeforeSettleEvent,
 	BeforeAgentStartCustomEvent,
@@ -796,8 +797,19 @@ export class ExtensionRunner {
 	/** Renderers of calls to `toolName`: extension resolvers in load order, then `base`. */
 	resolveToolRenderers(toolName: string, base: () => ToolRenderers | undefined): ToolRenderers | undefined {
 		const resolvers = this.extensions.flatMap((ext) => ext.toolRenderers ?? []);
-		const resolve = (index: number): ToolRenderers | undefined =>
-			index < resolvers.length ? resolvers[index](toolName, () => resolve(index + 1)) : base();
+		const resolve = (index: number): ToolRenderers | undefined => {
+			if (index >= resolvers.length) return base();
+			let nextRenderers: ToolRenderers | undefined;
+			const renderers = resolvers[index](toolName, () => {
+				nextRenderers = resolve(index + 1);
+				return nextRenderers;
+			});
+			// An empty legacy base still owns the standard renderer shell. Preserve that identity
+			// when an adapter adds only visibility; an absent base keeps the generic stock fallback.
+			return renderers?.isVisible && hasToolRendererDefinition(nextRenderers) && renderers.renderShell === undefined
+				? { ...renderers, renderShell: "default" }
+				: renderers;
+		};
 		return resolve(0);
 	}
 

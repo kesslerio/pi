@@ -248,6 +248,8 @@ All components implement:
 
 ```typescript
 interface Component {
+  readonly children?: readonly Component[];
+  isVisible?(): boolean;
   render(width: number): string[];
   handleInput?(data: string): void;
   handleMouse?(event: TuiMouseEvent): TuiMouseEventResult | undefined;
@@ -263,6 +265,14 @@ interface Component {
 | `invalidate()` | Required. Clear any cached render state so the next `render()` starts from scratch. Components without cached render state can use an empty implementation. |
 
 The TUI appends a full SGR reset and OSC 8 reset at the end of each rendered line. Styles do not carry across lines. If you emit multi-line text with styling, reapply styles per line or use `wrapTextWithAnsi()` so styles are preserved for each wrapped line.
+
+Components can expose their current `children`, as `Container`, `Box`, and `MouseRegion` do, so removing a child ends its input lifetime. Existing opaque hosts can still forward through `dispatchMouseEvent(child, event)` without adding child metadata: TUI retains the actual delegated target and observed owners. Missing optional metadata alone does not prove removal. A component that hides its entire subtree can implement `isVisible()` and return no rendered lines when false. Explicit component hiding and known hidden or removed owners deny input before delivery and after rendering.
+
+Stack-entry visibility uses the applicable mount's rendering context: the terminal viewport for explicit layouts, and available content width with unbounded height for document rendering, including inside boxes and overlays. Stock owners reuse their padding, scrollbar, and stack allocation rules before painting when those dimensions are available. Render observations belong to each current root, overlay, or layout occurrence; intrinsic measurements do not establish a mounted context. Keyboard focus can remain eligible through any current visible mount. A pressed or captured gesture stays with its original dispatch mount and owner path, even when the same component also appears elsewhere. Hiding or removing that mount cancels the gesture; showing it again requires a new press. Clipping, scrolling offscreen, and pointer motion outside the captured component's bounds do not end its lifetime. Overlay roots keep their existing focus fallback and restore behavior.
+
+Before the first draw, a custom host's private width transform can be unknown. Such paths retain legacy input behavior until rendering establishes their actual context; TUI does not guess dimensions, invoke extra renders, or trial visibility callbacks. Explicit `isVisible() === false` and known hidden ownership still deny input immediately. Custom hosts have no additional context API to implement. Once input targets are cancelled, restoring visibility requires fresh focus or a new press, subject to the existing overlay focus restoration policy.
+
+A manually focused private child with neither exposed nor observed ownership retains legacy focus behavior. Rendering its text alone does not establish which mounted host owns that input target.
 
 ### Mouse Input
 

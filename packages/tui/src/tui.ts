@@ -3,7 +3,16 @@
  */
 
 import { performance } from "node:perf_hooks";
+import {
+	DOCUMENT_CHILD_WIDTH,
+	documentChildWidth,
+	type InputMount,
+	type InputRenderContext,
+	renderInputChild,
+	renderWithInputContext,
+} from "./input-context.ts";
 import { isKeyRelease, matchesKey } from "./keys.ts";
+import { getLayoutNode, type LayoutViewport, type StackLayoutEntry } from "./layout-node.ts";
 import type { Terminal } from "./terminal.ts";
 import {
 	parseOscColorResponse,
@@ -74,19 +83,48 @@ export interface TuiMouseDispatchResult extends TuiMouseEventResult {
 	focusTarget?: Component;
 }
 
+// Evidence belongs to a dispatched target, not a global component registry. Opaque hosts were
+// valid before optional children metadata existed; their public delegation proves ownership.
+const mouseTargetOwners = new WeakMap<TuiMouseDispatchTarget, readonly Component[]>();
+const mouseTargetMounts = new WeakMap<
+	TuiMouseDispatchTarget,
+	{ root: Component; overlay?: OverlayStackEntry; layoutEntries?: readonly StackLayoutEntry[] }
+>();
+let mouseDispatchScope:
+	| {
+			owners: Component[];
+			eligible: (component: Component, owners: readonly Component[]) => boolean;
+	  }
+	| undefined;
+
 /**
  * Dispatch an event to a component and retain the exact target and coordinate
  * transform. Containers use this when forwarding events to nested children.
  */
 export function dispatchMouseEvent(component: Component, event: TuiMouseEvent): TuiMouseDispatchResult | undefined {
-	const result = component.handleMouse?.(event);
+	if (component.isVisible?.() === false) return undefined;
+	const scope = mouseDispatchScope;
+	if (scope && !scope.eligible(component, [...scope.owners].reverse())) return undefined;
+	scope?.owners.push(component);
+	let result: TuiMouseEventResult | undefined;
+	try {
+		result = component.handleMouse?.(event);
+	} finally {
+		scope?.owners.pop();
+	}
 	if (!result) return undefined;
 	if ("target" in result) {
 		// The component forwarded the event to a child it hosts. Like a delegating container, it routes
 		// keys to that child itself, so it keeps keyboard focus. Focusing the child directly would leave
 		// focus on a detached component once the host removes it, e.g. a closed settings submenu.
 		const forwarded = result as TuiMouseDispatchResult;
-		return forwarded.focus && component.handleInput ? { ...forwarded, focusTarget: component } : forwarded;
+		const target = { ...forwarded.target };
+		mouseTargetOwners.set(target, [...(mouseTargetOwners.get(forwarded.target) ?? []), component]);
+		return {
+			...forwarded,
+			target,
+			...(forwarded.focus && component.handleInput ? { focusTarget: component } : {}),
+		};
 	}
 	if (!result.handled && !result.capture && !result.focus) return undefined;
 	return {
@@ -103,6 +141,27 @@ export function dispatchMouseEvent(component: Component, event: TuiMouseEvent): 
 	};
 }
 
+/** Internal stock dispatch boundary, including direct handleMouse calls from opaque hosts. */
+export function dispatchMouseEventFromOwner(
+	owner: Component,
+	component: Component,
+	event: TuiMouseEvent,
+): TuiMouseDispatchResult | undefined {
+	const scope = mouseDispatchScope;
+	if (scope?.owners.at(-1) === owner) return dispatchMouseEvent(component, event);
+	if (owner.isVisible?.() === false || (scope && !scope.eligible(owner, [...scope.owners].reverse())))
+		return undefined;
+	scope?.owners.push(owner);
+	let result: TuiMouseDispatchResult | undefined;
+	try {
+		result = dispatchMouseEvent(component, event);
+	} finally {
+		scope?.owners.pop();
+	}
+	if (result) mouseTargetOwners.set(result.target, [...(mouseTargetOwners.get(result.target) ?? []), owner]);
+	return result;
+}
+
 /** Recreate local coordinates for a previously dispatched mouse target. */
 export function retargetMouseEvent(event: TuiMouseEvent, target: TuiMouseDispatchTarget): TuiMouseEvent {
 	return {
@@ -115,6 +174,10 @@ export function retargetMouseEvent(event: TuiMouseEvent, target: TuiMouseDispatc
 }
 
 export interface Component {
+	/** Hosted children, including those wrapped without changing their rendering. */
+	readonly children?: readonly Component[];
+	/** Live visibility for input lifetime checks. Hidden components must also render no lines. */
+	isVisible?(): boolean;
 	/**
 	 * Render the component to lines for the given viewport width
 	 * @param width - Current viewport width
@@ -330,6 +393,7 @@ type OverlayStackEntry = {
 	hidden: boolean;
 	focusOrder: number;
 	bounds?: OverlayBounds;
+	inputContext?: InputRenderContext;
 };
 
 type RenderedOverlayLayout = {
@@ -358,6 +422,10 @@ type OverlayFocusRestorePolicy = "clear" | "preserve";
 export class Container implements Component {
 	children: Component[] = [];
 	private mouseLayout?: { width: number; children: Array<{ component: Component; height: number }> };
+
+	[DOCUMENT_CHILD_WIDTH](width: number): number | undefined {
+		return this.render === Container.prototype.render ? width : undefined;
+	}
 
 	addChild(component: Component): void {
 		this.children.push(component);
@@ -389,7 +457,8 @@ export class Container implements Component {
 		let childY = 0;
 		for (const { component: child, height: childHeight } of mouseChildren) {
 			if (event.y >= childY && event.y < childY + childHeight) {
-				const result = dispatchMouseEvent(child, {
+				if (!this.children.includes(child)) return undefined;
+				const result = dispatchMouseEventFromOwner(this, child, {
 					...event,
 					y: event.y - childY,
 					height: childHeight,
@@ -406,7 +475,7 @@ export class Container implements Component {
 		const lines: string[] = [];
 		const mouseChildren: Array<{ component: Component; height: number }> = [];
 		for (const child of this.children) {
-			const childLines = child.render(width);
+			const childLines = renderInputChild(child, width);
 			mouseChildren.push({ component: child, height: childLines.length });
 			for (const line of childLines) {
 				lines.push(line);
@@ -507,6 +576,9 @@ export abstract class TuiBase extends Container implements TUI {
 	abstract readonly mode: TuiMode;
 	public terminal: Terminal;
 	private focusedComponent: Component | null = null;
+	private readonly observedFocusTargets = new WeakSet<Component>();
+	private readonly observedFocusOwners = new WeakMap<Component, readonly Component[]>();
+	private focusedComponentOwners: readonly Component[] = [];
 	private inputListeners = new Set<TuiInputListener>();
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
@@ -534,6 +606,7 @@ export abstract class TuiBase extends Container implements TUI {
 	private focusOrderCounter = 0;
 	private overlayStack: OverlayStackEntry[] = [];
 	private renderedOverlayLayouts: RenderedOverlayLayout[] = [];
+	private documentInputContext: InputRenderContext | undefined;
 
 	get hasOverlayEntries(): boolean {
 		return this.overlayStack.length > 0;
@@ -607,6 +680,16 @@ export abstract class TuiBase extends Container implements TUI {
 		overlayFocusRestore: OverlayFocusRestorePolicy;
 	}): void {
 		const previousFocus = this.focusedComponent;
+		// Focus can have been assigned before mounting and then parked by an overlay
+		// before the next input or render validation. Record known ownership before
+		// replacing it, so an automatic restore cannot erase that evidence.
+		if (
+			previousFocus &&
+			(this.isComponentMounted(previousFocus) ||
+				this.overlayStack.some((entry) => this.containsComponent(entry.component, previousFocus)))
+		) {
+			this.observedFocusTargets.add(previousFocus);
+		}
 		let nextFocus = component;
 		const previousFocusedOverlay = previousFocus
 			? this.overlayStack.find((entry) => entry.component === previousFocus && this.isOverlayVisible(entry))
@@ -651,6 +734,17 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 
 		this.focusedComponent = nextFocus;
+		// Parking focus on an overlay must not discard the observed route for a
+		// private child. Reusing that route proves a live opaque mount and still
+		// rejects its child after a known stock owner removes it.
+		this.focusedComponentOwners = nextFocus ? (this.observedFocusOwners.get(nextFocus) ?? []) : [];
+		if (
+			nextFocus &&
+			(this.isComponentMounted(nextFocus) ||
+				this.overlayStack.some((entry) => this.containsComponent(entry.component, nextFocus)))
+		) {
+			this.observedFocusTargets.add(nextFocus);
+		}
 
 		if (isFocusable(nextFocus)) {
 			nextFocus.focused = true;
@@ -712,15 +806,279 @@ export abstract class TuiBase extends Container implements TUI {
 		return this.children;
 	}
 
+	protected getRootInputMount(): InputMount {
+		return { component: this, width: this.terminal.columns, rendered: this.documentInputContext };
+	}
+
+	override removeChild(component: Component): void {
+		super.removeChild(component);
+		this.validateMouseTargets();
+	}
+
+	override clear(): void {
+		super.clear();
+		this.validateMouseTargets();
+	}
+
+	protected renderDocument(width: number): string[] {
+		const rendered = renderWithInputContext(this, width);
+		this.documentInputContext = rendered.context;
+		return rendered.lines;
+	}
+
 	private isComponentMounted(component: Component): boolean {
 		return this.getMountedRoots().some((child) => this.containsComponent(child, component));
 	}
 
 	private containsComponent(root: Component, target: Component): boolean {
 		if (root === target) return true;
-		if (!(root instanceof Container)) return false;
-		return root.children.some((child) => this.containsComponent(child, target));
+		return root.children?.some((child) => this.containsComponent(child, target)) ?? false;
 	}
+
+	/** Input lifetime depends on current ownership and visibility, never viewport clipping or pointer bounds. */
+	private isHostedInputTargetEligible(
+		mount: InputMount,
+		target: Component,
+		owners: readonly Component[] = [],
+		fixedPath = false,
+		layoutEntries: readonly StackLayoutEntry[] = [],
+	): boolean {
+		const observed = [target, ...owners];
+		const route = [...observed].reverse();
+		const visit = (
+			component: Component,
+			width: number | undefined,
+			viewport: LayoutViewport | undefined,
+			rendered: InputRenderContext | undefined,
+			ancestors: readonly Component[],
+			routeIndex: number,
+			entryIndex: number,
+		): boolean => {
+			if (ancestors.includes(component) || component.isVisible?.() === false) return false;
+			const nextRouteIndex = route[routeIndex] === component ? routeIndex + 1 : routeIndex;
+			// Direct handleMouse forwarding can omit intermediate known owners from dispatch metadata.
+			// Those edges still have to be present and visible in this same mount.
+			if (component === target)
+				return !fixedPath || (nextRouteIndex === route.length && entryIndex === layoutEntries.length);
+			const node = getLayoutNode(component);
+			while (!rendered?.viewport) {
+				const nested = rendered?.children.find((context) => context.component === component);
+				if (!nested) break;
+				rendered = nested;
+			}
+			const actualWidth = width ?? rendered?.width;
+			const stackWidth =
+				actualWidth === undefined ? undefined : documentChildWidth(component, actualWidth, component);
+			const entryViewport =
+				viewport ??
+				(stackWidth === undefined ? rendered?.viewport : { width: stackWidth, height: Number.MAX_SAFE_INTEGER });
+			const entries =
+				node && node.type !== "scroll"
+					? node.entries.filter((entry) => !entryViewport || (entry.visible?.(entryViewport) ?? true))
+					: undefined;
+			let children: readonly { component: Component; entry?: StackLayoutEntry }[];
+			if (node?.type === "scroll") children = [{ component: node.component }];
+			else if (node) {
+				// Unknown custom transforms keep legacy prepaint input. Never trial a predicate at guessed dimensions.
+				children = entries!.map((entry) => ({ component: entry.component, entry }));
+			} else if (component.children !== undefined)
+				children = component.children.map((child) => ({ component: child }));
+			else {
+				const index = observed.indexOf(component);
+				children = index > 0 ? [{ component: observed[index - 1]! }] : [];
+			}
+			const contextsByComponent = new Map<Component, InputRenderContext[]>();
+			for (const context of rendered?.children ?? []) {
+				const contexts = contextsByComponent.get(context.component);
+				if (contexts) contexts.push(context);
+				else contextsByComponent.set(context.component, [context]);
+			}
+			return children.some(({ component: child, entry }) => {
+				const expectedEntry = layoutEntries[entryIndex];
+				if (
+					expectedEntry &&
+					node &&
+					node.type !== "scroll" &&
+					node.entries.includes(expectedEntry) &&
+					entry !== expectedEntry
+				)
+					return false;
+				const nextEntryIndex = entry && entry === expectedEntry ? entryIndex + 1 : entryIndex;
+				const contexts =
+					contextsByComponent.get(child)?.filter((context) => !context.entry || context.entry === entry) ?? [];
+				const childWidth =
+					actualWidth === undefined
+						? undefined
+						: node?.type === "scroll"
+							? viewport
+								? node.state.getContentWidth(actualWidth)
+								: documentChildWidth(component, actualWidth, child)
+							: node?.type === "vstack"
+								? viewport
+									? Math.max(1, actualWidth)
+									: entryViewport?.width
+								: documentChildWidth(component, actualWidth, child, entries, entry);
+				const nextAncestors = [...ancestors, component];
+				return contexts.length > 0
+					? contexts.some((context) =>
+							visit(
+								child,
+								childWidth,
+								node ? viewport : undefined,
+								context,
+								nextAncestors,
+								nextRouteIndex,
+								nextEntryIndex,
+							),
+						)
+					: visit(
+							child,
+							childWidth,
+							node ? viewport : undefined,
+							undefined,
+							nextAncestors,
+							nextRouteIndex,
+							nextEntryIndex,
+						);
+			});
+		};
+		return visit(mount.component, mount.width, mount.viewport, mount.rendered, [], 0, 0);
+	}
+
+	private getOverlayInputMount(entry: OverlayStackEntry): InputMount {
+		return {
+			component: entry.component,
+			width: this.resolveOverlayLayout(entry.options, 0, this.terminal.columns, this.terminal.rows).width,
+			rendered: entry.inputContext,
+		};
+	}
+
+	protected isInputTargetEligible(target: Component, owners: readonly Component[] = []): boolean {
+		return (
+			this.isHostedInputTargetEligible(this.getRootInputMount(), target, owners) ||
+			this.overlayStack.some(
+				(entry) =>
+					this.isOverlayVisible(entry) &&
+					this.isHostedInputTargetEligible(this.getOverlayInputMount(entry), target, owners),
+			)
+		);
+	}
+
+	private dispatchMouseInMount(
+		component: Component,
+		event: TuiMouseEvent,
+		mount: InputMount,
+		owners: readonly Component[],
+		layoutEntries: readonly StackLayoutEntry[] = [],
+	): TuiMouseDispatchResult | undefined {
+		const previous = mouseDispatchScope;
+		mouseDispatchScope = {
+			owners: [...owners].reverse(),
+			eligible: (target, path) => this.isHostedInputTargetEligible(mount, target, path, true, layoutEntries),
+		};
+		try {
+			return dispatchMouseEvent(component, event);
+		} finally {
+			mouseDispatchScope = previous;
+		}
+	}
+
+	protected dispatchMouseFromRoot(
+		component: Component,
+		event: TuiMouseEvent,
+		owners: readonly Component[],
+		layoutEntries: readonly StackLayoutEntry[],
+	): TuiMouseDispatchResult | undefined {
+		const mount = this.getRootInputMount();
+		const result = this.dispatchMouseInMount(component, event, mount, owners, layoutEntries);
+		if (result) {
+			const path = [
+				result.target.component,
+				...(mouseTargetOwners.get(result.target) ?? []),
+				component,
+				...owners,
+			].filter((owner, index, all) => index === 0 || all[index - 1] !== owner);
+			mouseTargetOwners.set(result.target, path.slice(1));
+			mouseTargetMounts.set(result.target, { root: mount.component, layoutEntries });
+		}
+		return result;
+	}
+
+	protected isMouseTargetEligible(target: TuiMouseDispatchTarget): boolean {
+		const mount = mouseTargetMounts.get(target);
+		if (!mount) return this.isInputTargetEligible(target.component, mouseTargetOwners.get(target));
+		if (mount.overlay) {
+			return (
+				this.overlayStack.includes(mount.overlay) &&
+				this.isOverlayVisible(mount.overlay) &&
+				this.isHostedInputTargetEligible(
+					this.getOverlayInputMount(mount.overlay),
+					target.component,
+					mouseTargetOwners.get(target),
+					true,
+				)
+			);
+		}
+		const root = this.getRootInputMount();
+		return (
+			root.component === mount.root &&
+			this.isHostedInputTargetEligible(
+				root,
+				target.component,
+				mouseTargetOwners.get(target),
+				true,
+				mount.layoutEntries,
+			)
+		);
+	}
+
+	protected setMouseFocus(component: Component, target: TuiMouseDispatchTarget): void {
+		this.setFocus(component);
+		const path = [target.component, ...(mouseTargetOwners.get(target) ?? [])];
+		const index = path.indexOf(component);
+		this.focusedComponentOwners = index >= 0 ? path.slice(index + 1) : [];
+		if (this.isInputTargetEligible(component, this.focusedComponentOwners)) {
+			this.observedFocusTargets.add(component);
+			this.observedFocusOwners.set(component, this.focusedComponentOwners);
+		}
+	}
+
+	protected dispatchMouseToTarget(
+		event: TuiMouseEvent,
+		target: TuiMouseDispatchTarget,
+	): TuiMouseDispatchResult | undefined {
+		if (!this.isMouseTargetEligible(target)) return undefined;
+		const mount = mouseTargetMounts.get(target);
+		const inputMount = mount?.overlay ? this.getOverlayInputMount(mount.overlay) : this.getRootInputMount();
+		const result = this.dispatchMouseInMount(
+			target.component,
+			retargetMouseEvent(event, target),
+			inputMount,
+			mouseTargetOwners.get(target) ?? [],
+			mount?.layoutEntries,
+		);
+		if (result) {
+			mouseTargetOwners.set(result.target, [
+				...(mouseTargetOwners.get(result.target) ?? []),
+				...(mouseTargetOwners.get(target) ?? []),
+			]);
+			const mount = mouseTargetMounts.get(target);
+			if (mount) mouseTargetMounts.set(result.target, mount);
+		}
+		return result;
+	}
+
+	protected validateInputTargets(): void {
+		if (!this.focusedComponent) return;
+		// Overlay roots retain their existing fallback/restore policy. Descendants still use tree eligibility.
+		if (this.overlayStack.some((entry) => entry.component === this.focusedComponent)) return;
+		if (this.isInputTargetEligible(this.focusedComponent, this.focusedComponentOwners))
+			this.observedFocusTargets.add(this.focusedComponent);
+		else if (this.observedFocusTargets.has(this.focusedComponent) || this.focusedComponent.isVisible?.() === false)
+			this.setFocus(null);
+	}
+
+	protected validateMouseTargets(): void {}
 
 	/**
 	 * Show an overlay component with configurable positioning and sizing.
@@ -750,6 +1108,7 @@ export abstract class TuiBase extends Container implements TUI {
 					this.clearOverlayFocusRestoreFor(entry);
 					this.retargetOverlayPreFocus(entry);
 					this.overlayStack.splice(index, 1);
+					this.validateMouseTargets();
 					// Restore focus if this overlay had focus
 					if (this.focusedComponent === component) {
 						const topVisible = this.getTopmostVisibleOverlay();
@@ -762,6 +1121,7 @@ export abstract class TuiBase extends Container implements TUI {
 			setHidden: (hidden: boolean) => {
 				if (entry.hidden === hidden) return;
 				entry.hidden = hidden;
+				if (hidden) this.validateMouseTargets();
 				// Update focus when hiding/showing
 				if (hidden) {
 					this.clearOverlayFocusRestoreFor(entry);
@@ -832,6 +1192,7 @@ export abstract class TuiBase extends Container implements TUI {
 		this.clearOverlayFocusRestoreFor(overlay);
 		this.retargetOverlayPreFocus(overlay);
 		this.overlayStack.pop();
+		this.validateMouseTargets();
 		if (this.focusedComponent === overlay.component) {
 			// Find topmost visible overlay, or fall back to preFocus
 			const topVisible = this.getTopmostVisibleOverlay();
@@ -859,20 +1220,15 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	/** Keep overlay containers as keyboard focus owners when a nested control is clicked. */
-	protected resolveMouseFocusTarget(component: Component): Component {
-		for (let index = this.overlayStack.length - 1; index >= 0; index--) {
-			const overlay = this.overlayStack[index]!;
-			if (this.isOverlayVisible(overlay) && this.containsComponent(overlay.component, component)) {
-				return overlay.component;
-			}
-		}
-		return component;
+	protected resolveMouseFocusTarget(component: Component, target: TuiMouseDispatchTarget): Component {
+		return mouseTargetMounts.get(target)?.overlay?.component ?? component;
 	}
 
 	/** Dispatch to the visually topmost overlay under the pointer. */
 	protected dispatchMouseToOverlay(event: TuiMouseEvent): { hit: boolean; result?: TuiMouseDispatchResult } {
 		for (let index = this.renderedOverlayLayouts.length - 1; index >= 0; index--) {
 			const layout = this.renderedOverlayLayouts[index]!;
+			if (!this.isOverlayVisible(layout.entry) || !this.overlayStack.includes(layout.entry)) continue;
 			if (
 				event.screenX < layout.col ||
 				event.screenX >= layout.col + layout.width ||
@@ -881,13 +1237,19 @@ export abstract class TuiBase extends Container implements TUI {
 			) {
 				continue;
 			}
-			const result = dispatchMouseEvent(layout.entry.component, {
-				...event,
-				x: event.screenX - layout.col,
-				y: event.screenY - layout.row,
-				width: layout.width,
-				height: layout.height,
-			});
+			const result = this.dispatchMouseInMount(
+				layout.entry.component,
+				{
+					...event,
+					x: event.screenX - layout.col,
+					y: event.screenY - layout.row,
+					width: layout.width,
+					height: layout.height,
+				},
+				this.getOverlayInputMount(layout.entry),
+				[],
+			);
+			if (result) mouseTargetMounts.set(result.target, { root: layout.entry.component, overlay: layout.entry });
 			return result
 				? {
 						hit: true,
@@ -900,7 +1262,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 	/** Check if an overlay entry is currently visible */
 	private isOverlayVisible(entry: OverlayStackEntry): boolean {
-		if (entry.hidden) return false;
+		if (entry.hidden || entry.component.isVisible?.() === false) return false;
 		if (entry.options?.visible) {
 			return entry.options.visible(this.terminal.columns, this.terminal.rows);
 		}
@@ -996,6 +1358,7 @@ export abstract class TuiBase extends Container implements TUI {
 		this.cancelRenderTimer();
 		this.lastRenderAt = performance.now();
 		this.doRender();
+		this.validateInputTargets();
 	}
 
 	requestRender(force = false): void {
@@ -1023,6 +1386,7 @@ export abstract class TuiBase extends Container implements TUI {
 			this.renderRequested = false;
 			this.lastRenderAt = performance.now();
 			this.doRender();
+			this.validateInputTargets();
 		});
 	}
 
@@ -1046,6 +1410,7 @@ export abstract class TuiBase extends Container implements TUI {
 			this.renderRequested = false;
 			this.lastRenderAt = performance.now();
 			this.doRender();
+			this.validateInputTargets();
 			if (this.renderRequested) {
 				this.scheduleRender();
 			}
@@ -1060,6 +1425,7 @@ export abstract class TuiBase extends Container implements TUI {
 			return;
 		}
 
+		this.validateInputTargets();
 		if (this.inputListeners.size > 0) {
 			let current = data;
 			for (const listener of this.inputListeners) {
@@ -1118,6 +1484,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 		// Pass input to focused component (including Ctrl+C)
 		// The focused component can decide how to handle Ctrl+C
+		this.validateInputTargets();
 		if (this.focusedComponent?.handleInput) {
 			// Filter out key release events unless component opts in
 			if (isKeyRelease(data) && !this.focusedComponent.wantsKeyRelease) {
@@ -1370,7 +1737,9 @@ export abstract class TuiBase extends Container implements TUI {
 			const { width, maxHeight } = this.resolveOverlayLayout(options, 0, termWidth, termHeight);
 
 			// Render component at calculated width
-			let overlayLines = this.resolveFakeCursors(component.render(width));
+			const renderedComponent = renderWithInputContext(component, width);
+			entry.inputContext = renderedComponent.context;
+			let overlayLines = this.resolveFakeCursors(renderedComponent.lines);
 
 			// Apply maxHeight if specified
 			if (maxHeight !== undefined && overlayLines.length > maxHeight) {

@@ -593,6 +593,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	constrainedSampling?: false | ConstrainedSamplingConfig;
 	/** Controls whether ToolExecutionComponent renders the standard colored shell or the tool renders its own framing. */
 	renderShell?: "default" | "self";
+	/** TUI-only whole-row visibility, evaluated live. False hides spacing, content, and images without discarding state. A thrown error falls back to visible. HTML export ignores this predicate. */
+	isVisible?(context: ToolRenderContext<TState, Static<TParams>>): boolean;
 
 	/** Optional compatibility shim to prepare raw tool call arguments before schema validation. Must return an object conforming to TParams. */
 	prepareArguments?: (args: unknown) => Static<TParams>;
@@ -669,7 +671,7 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 
 type AnyToolDefinition = ToolDefinition<any, any, any>;
 
-export type ToolRenderers = Pick<AnyToolDefinition, "renderShell" | "renderCall" | "renderResult">;
+export type ToolRenderers = Pick<AnyToolDefinition, "renderShell" | "isVisible" | "renderCall" | "renderResult">;
 
 /**
  * Chooses how calls to a tool are drawn, including tools that are not registered. `next()` returns

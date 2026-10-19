@@ -1,3 +1,4 @@
+import { DOCUMENT_CHILD_WIDTH, renderInputChild, renderWithInputContext } from "../input-context.ts";
 import { LAYOUT_NODE, type ScrollLayoutNode } from "../layout-node.ts";
 import { type Component, Container } from "../tui.ts";
 
@@ -92,6 +93,10 @@ export class ScrollView extends Container {
 
 	getContentWidth(width: number): number {
 		return this.scrollbar === "always" && width > 1 ? width - 1 : width;
+	}
+
+	override [DOCUMENT_CHILD_WIDTH](width: number): number | undefined {
+		return this.render === ScrollView.prototype.render ? this.getContentWidth(width) : undefined;
 	}
 
 	private markScrollbarActivity(): void {
@@ -213,8 +218,12 @@ export class ScrollView extends Container {
 	}
 
 	override render(width: number): string[] {
+		return renderWithInputContext(this, width, () => this.renderContent(width)).lines;
+	}
+
+	private renderContent(width: number): string[] {
 		const contentWidth = this.getContentWidth(width);
-		const lines = this.child.render(contentWidth);
+		const lines = renderInputChild(this.child, contentWidth);
 		return contentWidth === width ? lines : lines.map((line) => `${line} `);
 	}
 
